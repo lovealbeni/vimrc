@@ -1,9 +1,9 @@
 set completeopt=menu,menuone,noselect
 set complete+=.
-set complete+=w
-set complete+=b
-set complete+=u
-set complete+=t
+set complete-=w
+set complete-=b
+set complete-=u
+set complete-=t
 
 set tags=./tags,tags;
 
@@ -26,12 +26,63 @@ set incsearch
 
 set smartindent
 
-inoremap <expr> <silent> <C-p> pumvisible() ? '<C-p>' : '<C-p><C-p>'
-
+" 添加自动触发补全的设置
 augroup AutoComplete
     autocmd!
-    autocmd InsertCharPre * if pumvisible() == 0 | call feedkeys("\<C-p>", 'n') | endif
+    autocmd InsertCharPre * if pumvisible() == 0 | call feedkeys("\<C-x>\<C-u>", 'n') | endif
 augroup END
+
+" 修改自动补全触发
+inoremap <expr> <C-p> pumvisible() ? "\<C-p>" : "\<C-x>\<C-u>"
+
+" 添加新的自动补全函数
+function! ProjectComplete(findstart, base)
+    if a:findstart
+        " 获取光标前的文本
+        let line = getline('.')
+        let start = col('.') - 1
+        while start > 0 && line[start - 1] =~ '\a'
+            let start -= 1
+        endwhile
+        return start
+    else
+        let results = []
+        let patterns = ['**/*.py', '**/*.js', '**/*.cpp', '**/*.h']
+        
+        " 对每个文件类型进行搜索
+        for pattern in patterns
+            let files = glob(pattern, 0, 1)
+            for file in files
+                if filereadable(file)
+                    " 读取文件内容并查找匹配
+                    let content = readfile(file)
+                    for line in content
+                        let words = split(line, '\W\+')
+                        for word in words
+                            if word =~ '^' . a:base && len(results) < 5
+                                call add(results, {'word': word, 'menu': '[' . fnamemodify(file, ':t') . ']'})
+                            endif
+                        endfor
+                        " 如果已经找到5个匹配项，就停止搜索
+                        if len(results) >= 5
+                            break
+                        endif
+                    endfor
+                endif
+                if len(results) >= 5
+                    break
+                endif
+            endfor
+            if len(results) >= 5
+                break
+            endif
+        endfor
+        return results
+    endif
+endfunction
+
+" 设置自定义补全
+set completefunc=ProjectComplete
 
 let g:loaded_files = []
 
