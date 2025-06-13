@@ -13,6 +13,8 @@ set path+=**
 set wildmenu
 set wildmode=list:longest,full
 
+set includeexpr=substitute(v:fname, '^@', 'src/','')
+
 syntax on
 
 set number
@@ -83,3 +85,11 @@ endfor
 inoremap <Space> <Space><C-r>=TriggerCompletion()<CR>
 inoremap <Tab> <Tab><C-r>=TriggerCompletion()<CR>
 inoremap <CR> <CR><C-r>=TriggerCompletion()<CR>
+
+filetype plugin indent on
+
+autocmd FileType html setl ofu=htmlcomplete#CompleteTags
+autocmd FileType css setl ofu=csscomplete#CompleteCSS
+autocmd FileType javascript,typescript setl ofu=javascriptcomplete#CompleteJS
+autocmd FileType typescriptreact setl ofu=javascriptcomplete#CompleteJS
+set omnifunc=syntaxcomplete#Complete
