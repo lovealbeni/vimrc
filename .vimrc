@@ -1,3 +1,4 @@
+let mapleader=" "
 set completeopt=menu,menuone,noselect
 set complete+=.
 set complete+=w
@@ -13,7 +14,17 @@ set path+=**
 set wildmenu
 set wildmode=list:longest,full
 
-set includeexpr=substitute(v:fname, '^@', 'src/','')
+" 重映射快捷键（这里用 <leader>f，你可以改成你喜欢的键）
+nnoremap <leader>p :call FindWithoutSlashes()<CR>
+
+function! FindWithoutSlashes()
+    " 获取光标下的单词
+    let word = expand('<cword>')
+    " 去掉所有的斜杠
+    let word = substitute(word, '/', '', 'g')
+    " 执行查找
+    execute 'find ' . word
+endfunction
 
 syntax on
 
@@ -85,6 +96,7 @@ endfor
 inoremap <Space> <Space><C-r>=TriggerCompletion()<CR>
 inoremap <Tab> <Tab><C-r>=TriggerCompletion()<CR>
 inoremap <CR> <CR><C-r>=TriggerCompletion()<CR>
+nnoremap <leader>f :find<Space>
 
 filetype plugin indent on
 
