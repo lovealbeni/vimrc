@@ -130,6 +130,11 @@ set report=0
 set statusline+=%{&modified?'[+]':''}
 set laststatus=2
 
+" 每个窗口上方显示文件名（需要支持 'winbar' 的较新 Vim，不支持的版本自动跳过）
+if exists('+winbar')
+  set winbar=\ %f%m
+endif
+
 " ===== 纯 Vimscript 模糊搜索（文件名 / 内容，带预览，回车打开选中文件） =====
 " 用法：
 "   <leader>ff  模糊搜索项目文件名，右侧预览，回车打开选中文件
