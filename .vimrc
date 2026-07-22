@@ -135,6 +135,7 @@ set laststatus=2
 " 用法：
 "   <leader>ff  模糊搜索项目文件名，右侧预览，回车打开选中文件
 "   <leader>fg  搜索项目内容（变量名、字符串等，输入即搜），回车打开并跳转到匹配行
+"   可视模式 <leader>fg  把选中内容作为全局搜索的关键词
 " 搜索窗口中：Ctrl-j / Ctrl-k（或方向键）上下选择，回车打开，Esc 关闭，退格删除字符
 " 依赖 ripgrep(rg)；没有 rg 时文件名搜索自动退化为 globpath
 
@@ -149,9 +150,9 @@ if empty(prop_type_get('ff_match'))
   call prop_type_add('ff_match', #{highlight: 'Search', priority: 10})
 endif
 
-function! s:FuzzyStart(kind) abort
+function! s:FuzzyStart(kind, ...) abort
   let s:ff.kind = a:kind
-  let s:ff.query = ''
+  let s:ff.query = a:0 > 0 ? a:1 : ''
   let s:ff.matches = []
   let s:ff.sel = 0
   if a:kind ==# 'files'
@@ -344,3 +345,113 @@ command! FFiles call <SID>FuzzyStart('files')
 command! FGrep  call <SID>FuzzyStart('grep')
 nnoremap <leader>ff :FFiles<CR>
 nnoremap <leader>fg :FGrep<CR>
+
+" 可视模式下 <leader>fg：把选中的内容作为全局搜索的关键词（结果带预览，回车打开）
+function! s:VisualSearch() abort
+  let l:save = @"
+  normal! gvy
+  let l:text = @"
+  let @" = l:save
+  " 多行选择时取第一行，去掉首尾空白
+  let l:text = trim(split(l:text, "\n")[0])
+  if !empty(l:text)
+    call s:FuzzyStart('grep', l:text)
+  endif
+endfunction
+xnoremap <leader>fg :<C-u>call <SID>VisualSearch()<CR>
+
+" ===== 纯 Vimscript 文件树侧边栏 =====
+" <leader>e 开关侧边栏
+" 树中按键：回车(或 o) 打开文件 / 展开折叠目录，r 刷新，q 关闭
+
+let s:tree = {'bufnr': -1, 'expanded': {}, 'lines': []}
+
+function! s:TreeToggle() abort
+  let l:win = bufwinid(s:tree.bufnr)
+  if l:win != -1
+    call win_gotoid(l:win)
+    close
+    return
+  endif
+  call s:TreeOpen()
+endfunction
+
+function! s:TreeOpen() abort
+  let s:tree.expanded = {}
+  topleft vertical 30new
+  let s:tree.bufnr = bufnr('%')
+  setlocal buftype=nofile bufhidden=wipe noswapfile nobuflisted
+  setlocal nonumber norelativenumber nowrap signcolumn=no cursorline winfixwidth
+  file FileTree
+  nnoremap <buffer> <CR> :call <SID>TreeActivate()<CR>
+  nnoremap <buffer> o :call <SID>TreeActivate()<CR>
+  nnoremap <buffer> r :call <SID>TreeRender()<CR>
+  nnoremap <buffer> q :close<CR>
+  call s:TreeRender()
+endfunction
+
+function! s:TreeRender() abort
+  let s:tree.lines = []
+  let l:display = []
+  call s:TreeAddNodes(getcwd(), 0, l:display, 0)
+  if empty(l:display)
+    let l:display = ['（空目录）']
+  endif
+  let l:buf = s:tree.bufnr
+  call setbufvar(l:buf, '&modifiable', 1)
+  call setbufline(l:buf, 1, l:display)
+  let l:total = len(getbufline(l:buf, 1, '$'))
+  if l:total > len(l:display)
+    call deletebufline(l:buf, len(l:display) + 1, l:total)
+  endif
+  call setbufvar(l:buf, '&modifiable', 0)
+endfunction
+
+" 递归构建目录内容：目录在前，文件在后，按名称排序（忽略大小写）
+function! s:TreeAddNodes(dir, depth, display, guard) abort
+  if a:guard > 20
+    return
+  endif
+  let l:entries = readdir(a:dir)
+  call filter(l:entries, 'v:val !=# ".git"')
+  let l:dirs = filter(copy(l:entries), 'isdirectory(a:dir . "/" . v:val)')
+  let l:files = filter(copy(l:entries), '!isdirectory(a:dir . "/" . v:val)')
+  call sort(l:dirs, 'i')
+  call sort(l:files, 'i')
+  for l:name in l:dirs + l:files
+    let l:path = a:dir . '/' . l:name
+    let l:isdir = isdirectory(l:path)
+    let l:indent = repeat('  ', a:depth)
+    if l:isdir
+      let l:open = get(s:tree.expanded, l:path, 0)
+      call add(a:display, l:indent . (l:open ? '▾ ' : '▸ ') . l:name . '/')
+      call add(s:tree.lines, #{path: l:path, isdir: 1})
+      if l:open
+        call s:TreeAddNodes(l:path, a:depth + 1, a:display, a:guard + 1)
+      endif
+    else
+      call add(a:display, l:indent . '  ' . l:name)
+      call add(s:tree.lines, #{path: l:path, isdir: 0})
+    endif
+  endfor
+endfunction
+
+function! s:TreeActivate() abort
+  let l:idx = line('.') - 1
+  if l:idx < 0 || l:idx >= len(s:tree.lines)
+    return
+  endif
+  let l:node = s:tree.lines[l:idx]
+  if l:node.isdir
+    let s:tree.expanded[l:node.path] = !get(s:tree.expanded, l:node.path, 0)
+    let l:lnum = line('.')
+    call s:TreeRender()
+    call cursor(min([l:lnum, line('$')]), 1)
+  else
+    " 在之前的窗口中打开文件，焦点随之过去
+    wincmd p
+    execute 'edit ' . fnameescape(l:node.path)
+  endif
+endfunction
+
+nnoremap <leader>e :call <SID>TreeToggle()<CR>
