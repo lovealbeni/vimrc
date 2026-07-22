@@ -40,6 +40,12 @@ set incsearch
 
 set smartindent
 
+" Set default indentation to 2 spaces
+set shiftwidth=2
+set tabstop=2
+set softtabstop=2
+set expandtab
+
 " 自动检测并设置 shiftwidth
 function! SetIndent()
     let l:line = getline(1, 100)
@@ -71,17 +77,17 @@ function! TriggerCompletion()
     if &filetype == 'help' || &filetype == 'gitcommit'
         return ""
     endif
-    
+
     " 检查是否已经在补全菜单中
     if pumvisible()
         return ""
     endif
-    
+
     " 检查当前行是否为空
     if getline('.') =~ '^\s*$'
         return ""
     endif
-    
+
     " 触发补全
     call feedkeys("\<C-n>", 'n')
     return ""
@@ -105,3 +111,236 @@ autocmd FileType css setl ofu=csscomplete#CompleteCSS
 autocmd FileType javascript,typescript setl ofu=javascriptcomplete#CompleteJS
 autocmd FileType typescriptreact setl ofu=javascriptcomplete#CompleteJS
 set omnifunc=syntaxcomplete#Complete
+
+" 自动读取文件变化配置
+set autoread
+set updatetime=1000
+
+" 定时检查文件变化
+augroup AutoReload
+  autocmd!
+  autocmd CursorHold,CursorHoldI * checktime
+  autocmd BufEnter * checktime
+  autocmd FocusGained * checktime
+augroup END
+
+" 可选：添加文件修改提示
+set report=0
+
+" 可选：在状态栏显示文件状态
+set statusline+=%{&modified?'[+]':''}
+set laststatus=2
+
+" ===== 纯 Vimscript 模糊搜索（文件名 / 内容，带预览，回车打开选中文件） =====
+" 用法：
+"   <leader>ff  模糊搜索项目文件名，右侧预览，回车打开选中文件
+"   <leader>fg  搜索项目内容（变量名、字符串等，输入即搜），回车打开并跳转到匹配行
+" 搜索窗口中：Ctrl-j / Ctrl-k（或方向键）上下选择，回车打开，Esc 关闭，退格删除字符
+" 依赖 ripgrep(rg)；没有 rg 时文件名搜索自动退化为 globpath
+
+let s:ff = {'kind': 'files', 'query': '', 'items': [], 'matches': [], 'sel': 0,
+      \ 'list_id': -1, 'prev_id': -1, 'maxshow': 300}
+
+" 选中行 / 预览中匹配行的高亮类型
+if empty(prop_type_get('ff_sel'))
+  call prop_type_add('ff_sel', #{highlight: 'PmenuSel', priority: 10})
+endif
+if empty(prop_type_get('ff_match'))
+  call prop_type_add('ff_match', #{highlight: 'Search', priority: 10})
+endif
+
+function! s:FuzzyStart(kind) abort
+  let s:ff.kind = a:kind
+  let s:ff.query = ''
+  let s:ff.matches = []
+  let s:ff.sel = 0
+  if a:kind ==# 'files'
+    if executable('rg')
+      let s:ff.items = systemlist('rg --files --hidden --glob "!.git" 2>/dev/null')
+    else
+      let s:ff.items = filter(split(globpath('.', '**/*'), "\n"), '!isdirectory(v:val)')
+    endif
+  else
+    let s:ff.items = []
+  endif
+
+  let l:total_w = &columns - 8
+  let l:list_w = float2nr(l:total_w * 0.45)
+  let l:h = &lines - 10
+
+  " 右侧预览窗口
+  let s:ff.prev_id = popup_create([''], #{
+        \ title: ' 预览 ',
+        \ line: 3, col: 6 + l:list_w,
+        \ minwidth: l:total_w - l:list_w - 2, maxwidth: l:total_w - l:list_w - 2,
+        \ minheight: l:h, maxheight: l:h,
+        \ border: [], wrap: 0, scrollbar: 0,
+        \ })
+
+  " 左侧列表窗口（接收键盘输入）
+  let s:ff.list_id = popup_create([''], #{
+        \ title: ' ',
+        \ line: 3, col: 4,
+        \ minwidth: l:list_w, maxwidth: l:list_w,
+        \ minheight: l:h, maxheight: l:h,
+        \ border: [], padding: [0, 1, 0, 1],
+        \ wrap: 0, mapping: 0,
+        \ filter: function('s:FuzzyFilter'),
+        \ })
+
+  call s:FuzzyUpdate()
+endfunction
+
+function! s:FuzzyFilter(id, key) abort
+  if a:key ==# "\<Esc>" || a:key ==# "\<C-c>"
+    call s:FuzzyClose()
+  elseif a:key ==# "\<CR>"
+    call s:FuzzyAccept()
+  elseif a:key ==# "\<C-j>" || a:key ==# "\<C-n>" || a:key ==# "\<Down>"
+    call s:FuzzyMove(1)
+  elseif a:key ==# "\<C-k>" || a:key ==# "\<C-p>" || a:key ==# "\<Up>"
+    call s:FuzzyMove(-1)
+  elseif a:key ==# "\<BS>" || a:key ==# "\<C-h>"
+    if !empty(s:ff.query)
+      let s:ff.query = strcharpart(s:ff.query, 0, strchars(s:ff.query) - 1)
+      call s:FuzzyUpdate()
+    endif
+  elseif strchars(a:key) == 1 && char2nr(a:key) >= 32
+    let s:ff.query .= a:key
+    call s:FuzzyUpdate()
+  endif
+  return 1
+endfunction
+
+" 上下移动选中项（循环），并刷新高亮和预览
+function! s:FuzzyMove(step) abort
+  if empty(s:ff.matches)
+    return
+  endif
+  let s:ff.sel = (s:ff.sel + a:step) % len(s:ff.matches)
+  if s:ff.sel < 0
+    let s:ff.sel += len(s:ff.matches)
+  endif
+  call s:FuzzyRender()
+  call s:FuzzyPreview()
+endfunction
+
+function! s:FuzzyUpdate() abort
+  if s:ff.kind ==# 'files'
+    if empty(s:ff.query)
+      let s:ff.matches = s:ff.items[:s:ff.maxshow - 1]
+    else
+      let s:ff.matches = matchfuzzy(s:ff.items, s:ff.query)[:s:ff.maxshow - 1]
+    endif
+  else
+    if strchars(s:ff.query) >= 2
+      let l:cmd = 'rg --vimgrep --no-heading --smart-case --hidden'
+            \ . ' --glob "!.git" -- ' . shellescape(s:ff.query)
+            \ . ' 2>/dev/null | head -n ' . s:ff.maxshow
+      let s:ff.matches = systemlist(l:cmd)
+    else
+      let s:ff.matches = []
+    endif
+  endif
+  let s:ff.sel = 0
+  call popup_setoptions(s:ff.list_id, #{title:
+        \ (s:ff.kind ==# 'files' ? ' 文件: ' : ' 内容: ') . s:ff.query . ' '})
+  call s:FuzzyRender()
+  call s:FuzzyPreview()
+endfunction
+
+" 重绘列表，用文本属性高亮当前选中行
+function! s:FuzzyRender() abort
+  let l:lines = []
+  let l:i = 0
+  for l:item in s:ff.matches
+    if l:i == s:ff.sel
+      call add(l:lines, #{text: l:item,
+            \ props: [#{col: 1, length: max([1, strlen(l:item)]), type: 'ff_sel'}]})
+    else
+      call add(l:lines, #{text: l:item})
+    endif
+    let l:i += 1
+  endfor
+  if empty(l:lines)
+    let l:lines = [#{text: '（无结果）'}]
+  endif
+  call popup_settext(s:ff.list_id, l:lines)
+endfunction
+
+function! s:FuzzyCurrent() abort
+  if empty(s:ff.matches) || s:ff.sel >= len(s:ff.matches)
+    return ''
+  endif
+  return s:ff.matches[s:ff.sel]
+endfunction
+
+function! s:FuzzyPreview() abort
+  let l:item = s:FuzzyCurrent()
+  if empty(l:item)
+    call popup_settext(s:ff.prev_id, [''])
+    return
+  endif
+  let l:lnum = 1
+  if s:ff.kind ==# 'files'
+    let l:path = l:item
+  else
+    " rg --vimgrep 输出格式： 文件:行:列:内容
+    let l:m = matchlist(l:item, '^\([^:]*\):\(\d\+\):')
+    let l:path = l:m[1]
+    let l:lnum = str2nr(l:m[2])
+  endif
+  if empty(l:path) || !filereadable(l:path)
+    call popup_settext(s:ff.prev_id, ['（无法预览）'])
+    return
+  endif
+  " 让匹配行显示在预览窗口靠上的位置
+  let l:start = max([0, l:lnum - 6])
+  let l:lines = readfile(l:path, '', l:lnum + 200)[l:start :]
+  if empty(l:lines)
+    let l:lines = ['（空文件或二进制文件）']
+  endif
+  " 统一转成 dict（popup_settext 不允许字符串和 dict 混用）；
+  " 内容搜索时高亮预览中的匹配行
+  let l:idx = l:lnum - 1 - l:start
+  call map(l:lines, {i, v -> (s:ff.kind ==# 'grep' && i == l:idx)
+        \ ? #{text: v, props: [#{col: 1, length: max([1, strlen(v)]), type: 'ff_match'}]}
+        \ : #{text: v}})
+  call popup_settext(s:ff.prev_id, l:lines)
+  call popup_setoptions(s:ff.prev_id, #{title: ' ' . l:path . ' '})
+endfunction
+
+function! s:FuzzyAccept() abort
+  let l:item = s:FuzzyCurrent()
+  if empty(l:item)
+    return
+  endif
+  let l:kind = s:ff.kind
+  call s:FuzzyClose()
+  if l:kind ==# 'files'
+    execute 'edit ' . fnameescape(l:item)
+  else
+    let l:m = matchlist(l:item, '^\([^:]*\):\(\d\+\):')
+    if !empty(l:m[1])
+      execute 'edit +' . l:m[2] . ' ' . fnameescape(l:m[1])
+      normal! zz
+    endif
+  endif
+endfunction
+
+function! s:FuzzyClose() abort
+  if s:ff.list_id > 0
+    call popup_close(s:ff.list_id)
+  endif
+  if s:ff.prev_id > 0
+    call popup_close(s:ff.prev_id)
+  endif
+  let s:ff.list_id = -1
+  let s:ff.prev_id = -1
+  redraw
+endfunction
+
+command! FFiles call <SID>FuzzyStart('files')
+command! FGrep  call <SID>FuzzyStart('grep')
+nnoremap <leader>ff :FFiles<CR>
+nnoremap <leader>fg :FGrep<CR>
