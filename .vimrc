@@ -102,7 +102,6 @@ endfor
 inoremap <Space> <Space><C-r>=TriggerCompletion()<CR>
 inoremap <Tab> <Tab><C-r>=TriggerCompletion()<CR>
 inoremap <CR> <CR><C-r>=TriggerCompletion()<CR>
-nnoremap <leader>f :find<Space>
 
 filetype plugin indent on
 
@@ -135,17 +134,25 @@ set laststatus=2
 " 用法：
 "   <leader>ff  模糊搜索项目文件名，右侧预览，回车打开选中文件
 "   <leader>fg  搜索项目内容（变量名、字符串等，输入即搜），回车打开并跳转到匹配行
-"   可视模式 <leader>fg  把选中内容作为全局搜索的关键词
+"   可视模式 <leader>ff / <leader>fg  把选中内容作为搜索关键词
+"   弹窗中：回车=当前窗口打开，-=水平分屏打开，\=垂直分屏打开
 " 搜索窗口中：Ctrl-j / Ctrl-k（或方向键）上下选择，回车打开，Esc 关闭，退格删除字符
 " 依赖 ripgrep(rg)；没有 rg 时文件名搜索自动退化为 globpath
 
 let s:ff = {'kind': 'files', 'query': '', 'items': [], 'matches': [], 'sel': 0,
+      \ 'first': 0, 'win_h': 20, 'prev_path': '',
       \ 'list_id': -1, 'prev_id': -1, 'maxshow': 300}
 
+" 弹窗配色：弹窗默认使用 Pmenu（浅底色），深色终端下看不清，
+" 这里让弹窗跟随终端默认前景/背景色，选中行用反色显示
+highlight FuzzyPopup ctermfg=NONE ctermbg=NONE guifg=NONE guibg=NONE
+highlight FuzzySel cterm=reverse gui=reverse
+
 " 选中行 / 预览中匹配行的高亮类型
-if empty(prop_type_get('ff_sel'))
-  call prop_type_add('ff_sel', #{highlight: 'PmenuSel', priority: 10})
+if !empty(prop_type_get('ff_sel'))
+  call prop_type_delete('ff_sel')
 endif
+call prop_type_add('ff_sel', #{highlight: 'FuzzySel', priority: 10})
 if empty(prop_type_get('ff_match'))
   call prop_type_add('ff_match', #{highlight: 'Search', priority: 10})
 endif
@@ -155,9 +162,11 @@ function! s:FuzzyStart(kind, ...) abort
   let s:ff.query = a:0 > 0 ? a:1 : ''
   let s:ff.matches = []
   let s:ff.sel = 0
+  let s:ff.first = 0
+  let s:ff.prev_path = ''
   if a:kind ==# 'files'
     if executable('rg')
-      let s:ff.items = systemlist('rg --files --hidden --glob "!.git" 2>/dev/null')
+      let s:ff.items = systemlist('rg --files --hidden --glob "!.git" 2>/dev/null | sort')
     else
       let s:ff.items = filter(split(globpath('.', '**/*'), "\n"), '!isdirectory(v:val)')
     endif
@@ -168,6 +177,7 @@ function! s:FuzzyStart(kind, ...) abort
   let l:total_w = &columns - 8
   let l:list_w = float2nr(l:total_w * 0.45)
   let l:h = &lines - 10
+  let s:ff.win_h = l:h
 
   " 右侧预览窗口
   let s:ff.prev_id = popup_create([''], #{
@@ -176,6 +186,7 @@ function! s:FuzzyStart(kind, ...) abort
         \ minwidth: l:total_w - l:list_w - 2, maxwidth: l:total_w - l:list_w - 2,
         \ minheight: l:h, maxheight: l:h,
         \ border: [], wrap: 0, scrollbar: 0,
+        \ highlight: 'FuzzyPopup',
         \ })
 
   " 左侧列表窗口（接收键盘输入）
@@ -186,6 +197,7 @@ function! s:FuzzyStart(kind, ...) abort
         \ minheight: l:h, maxheight: l:h,
         \ border: [], padding: [0, 1, 0, 1],
         \ wrap: 0, mapping: 0,
+        \ highlight: 'FuzzyPopup',
         \ filter: function('s:FuzzyFilter'),
         \ })
 
@@ -196,7 +208,11 @@ function! s:FuzzyFilter(id, key) abort
   if a:key ==# "\<Esc>" || a:key ==# "\<C-c>"
     call s:FuzzyClose()
   elseif a:key ==# "\<CR>"
-    call s:FuzzyAccept()
+    call s:FuzzyAccept('edit')
+  elseif a:key ==# '-'
+    call s:FuzzyAccept('split')
+  elseif a:key ==# '\'
+    call s:FuzzyAccept('vsplit')
   elseif a:key ==# "\<C-j>" || a:key ==# "\<C-n>" || a:key ==# "\<Down>"
     call s:FuzzyMove(1)
   elseif a:key ==# "\<C-k>" || a:key ==# "\<C-p>" || a:key ==# "\<Up>"
@@ -232,6 +248,31 @@ function! s:FuzzyUpdate() abort
       let s:ff.matches = s:ff.items[:s:ff.maxshow - 1]
     else
       let s:ff.matches = matchfuzzy(s:ff.items, s:ff.query)[:s:ff.maxshow - 1]
+      if empty(s:ff.matches)
+        " 选中内容含多余字符（引号、行号、部分路径等）时的兜底：
+        " 按非单词字符切分，统计每个候选命中的片段数（相似度），按相似度降序排序
+        let l:tokens = filter(split(tolower(s:ff.query), '[^0-9a-zA-Z_.-]\+'), '!empty(v:val)')
+        if !empty(l:tokens)
+          let l:scored = []
+          let l:i = 0
+          for l:item in s:ff.items
+            let l:lower = tolower(l:item)
+            let l:score = 0
+            for l:t in l:tokens
+              if stridx(l:lower, l:t) >= 0
+                let l:score += 1
+              endif
+            endfor
+            if l:score > 0
+              call add(l:scored, [l:score, l:i, l:item])
+            endif
+            let l:i += 1
+          endfor
+          " 相似度降序，同分保持原顺序
+          call sort(l:scored, {a, b -> b[0] == a[0] ? a[1] - b[1] : b[0] - a[0]})
+          let s:ff.matches = map(l:scored, 'v:val[2]')[:s:ff.maxshow - 1]
+        endif
+      endif
     endif
   else
     if strchars(s:ff.query) >= 2
@@ -244,6 +285,7 @@ function! s:FuzzyUpdate() abort
     endif
   endif
   let s:ff.sel = 0
+  let s:ff.first = 0
   call popup_setoptions(s:ff.list_id, #{title:
         \ (s:ff.kind ==# 'files' ? ' 文件: ' : ' 内容: ') . s:ff.query . ' '})
   call s:FuzzyRender()
@@ -267,6 +309,13 @@ function! s:FuzzyRender() abort
     let l:lines = [#{text: '（无结果）'}]
   endif
   call popup_settext(s:ff.list_id, l:lines)
+  " 让选中行始终可见：移出可见区域时滚动列表
+  if s:ff.sel < s:ff.first
+    let s:ff.first = s:ff.sel
+  elseif s:ff.sel >= s:ff.first + s:ff.win_h
+    let s:ff.first = s:ff.sel - s:ff.win_h + 1
+  endif
+  call popup_setoptions(s:ff.list_id, #{firstline: s:ff.first + 1})
 endfunction
 
 function! s:FuzzyCurrent() abort
@@ -280,6 +329,7 @@ function! s:FuzzyPreview() abort
   let l:item = s:FuzzyCurrent()
   if empty(l:item)
     call popup_settext(s:ff.prev_id, [''])
+    call s:PreviewSyntax('')
     return
   endif
   let l:lnum = 1
@@ -293,6 +343,7 @@ function! s:FuzzyPreview() abort
   endif
   if empty(l:path) || !filereadable(l:path)
     call popup_settext(s:ff.prev_id, ['（无法预览）'])
+    call s:PreviewSyntax('')
     return
   endif
   " 让匹配行显示在预览窗口靠上的位置
@@ -309,9 +360,24 @@ function! s:FuzzyPreview() abort
         \ : #{text: v}})
   call popup_settext(s:ff.prev_id, l:lines)
   call popup_setoptions(s:ff.prev_id, #{title: ' ' . l:path . ' '})
+  call s:PreviewSyntax(l:path)
 endfunction
 
-function! s:FuzzyAccept() abort
+" 预览窗语法高亮：按真实文件路径检测文件类型；同一文件不重复检测
+function! s:PreviewSyntax(path) abort
+  if s:ff.prev_path ==# a:path
+    return
+  endif
+  let s:ff.prev_path = a:path
+  if empty(a:path)
+    call win_execute(s:ff.prev_id, 'setlocal syntax=')
+  else
+    call win_execute(s:ff.prev_id, 'doautocmd <nomodeline> BufRead ' . fnameescape(a:path))
+  endif
+endfunction
+
+" how: edit=当前窗口打开, split=水平分屏, vsplit=垂直分屏
+function! s:FuzzyAccept(how) abort
   let l:item = s:FuzzyCurrent()
   if empty(l:item)
     return
@@ -319,11 +385,11 @@ function! s:FuzzyAccept() abort
   let l:kind = s:ff.kind
   call s:FuzzyClose()
   if l:kind ==# 'files'
-    execute 'edit ' . fnameescape(l:item)
+    execute a:how . ' ' . fnameescape(l:item)
   else
     let l:m = matchlist(l:item, '^\([^:]*\):\(\d\+\):')
     if !empty(l:m[1])
-      execute 'edit +' . l:m[2] . ' ' . fnameescape(l:m[1])
+      execute a:how . ' +' . l:m[2] . ' ' . fnameescape(l:m[1])
       normal! zz
     endif
   endif
@@ -346,19 +412,32 @@ command! FGrep  call <SID>FuzzyStart('grep')
 nnoremap <leader>ff :FFiles<CR>
 nnoremap <leader>fg :FGrep<CR>
 
-" 可视模式下 <leader>fg：把选中的内容作为全局搜索的关键词（结果带预览，回车打开）
-function! s:VisualSearch() abort
+" 获取可视模式选中的文本（多行选择时取第一行，去掉首尾空白）
+function! s:GetVisualText() abort
   let l:save = @"
   normal! gvy
   let l:text = @"
   let @" = l:save
-  " 多行选择时取第一行，去掉首尾空白
-  let l:text = trim(split(l:text, "\n")[0])
+  return trim(split(l:text, "\n")[0])
+endfunction
+
+" 可视模式下 <leader>fg：把选中的内容作为全局搜索的关键词（结果带预览，回车打开）
+function! s:VisualSearch() abort
+  let l:text = s:GetVisualText()
   if !empty(l:text)
     call s:FuzzyStart('grep', l:text)
   endif
 endfunction
 xnoremap <leader>fg :<C-u>call <SID>VisualSearch()<CR>
+
+" 可视模式下 <leader>ff：把选中的内容作为文件路径/名称进行模糊查找
+function! s:VisualFindFile() abort
+  let l:text = s:GetVisualText()
+  if !empty(l:text)
+    call s:FuzzyStart('files', l:text)
+  endif
+endfunction
+xnoremap <leader>ff :<C-u>call <SID>VisualFindFile()<CR>
 
 " ===== 纯 Vimscript 文件树侧边栏 =====
 " <leader>e 开关侧边栏
@@ -455,3 +534,509 @@ function! s:TreeActivate() abort
 endfunction
 
 nnoremap <leader>e :call <SID>TreeToggle()<CR>
+
+" ===== 纯 Vimscript Git 状态窗口 =====
+" <leader>g 在独立标签页打开/关闭，内容只有 git 信息：
+"   左侧状态列表，右侧两个窗格用 vim 内置 diff 模式做 split diff（旧版本 | 新版本）
+" 状态窗口中按键：
+"   j/k 移动（右侧实时显示该文件的 split diff）
+"   回车  打开选中的文件
+"   s     stage 选中的文件（git add，未跟踪文件/目录同样适用）
+"   u     unstage 选中的文件（git restore --staged，取消暂存）
+"   r     刷新，q 关闭
+
+let s:git = {'bufnr': -1, 'oldbuf': -1, 'newbuf': -1, 'lines': [], 'root': '', 'closing': 0, 'difftimer': -1}
+
+function! s:GitToggle() abort
+  if s:git.bufnr > 0 && bufwinid(s:git.bufnr) != -1
+    call s:GitClose()
+    return
+  endif
+  call s:GitOpen()
+endfunction
+
+function! s:GitScratch(name) abort
+  setlocal buftype=nofile bufhidden=wipe noswapfile nobuflisted
+  setlocal nonumber norelativenumber nowrap signcolumn=no
+  execute 'file ' . a:name
+  nnoremap <buffer> q :call <SID>GitClose()<CR>
+endfunction
+
+function! s:GitOpen() abort
+  let l:root = trim(system('git rev-parse --show-toplevel 2>/dev/null'))
+  if v:shell_error != 0 || empty(l:root)
+    echo '当前目录不是 git 仓库'
+    return
+  endif
+  let s:git.root = l:root
+  let s:git.closing = 0
+
+  " 独立标签页：状态列表 + 两个 diff 窗格
+  tabnew
+  let s:git.bufnr = bufnr('%')
+  call s:GitScratch('GitStatus')
+  setlocal cursorline winfixwidth
+  nnoremap <buffer> <CR> :call <SID>GitOpenFile()<CR>
+  nnoremap <buffer> s :call <SID>GitStageFile()<CR>
+  nnoremap <buffer> u :call <SID>GitUnstageFile()<CR>
+  nnoremap <buffer> r :call <SID>GitRefresh()<CR>
+  autocmd CursorMoved <buffer> call <SID>GitScheduleDiff()
+  autocmd BufWipeout <buffer> call <SID>GitClose()
+
+  " 中：旧版本（HEAD / 暂存区）
+  belowright vertical new
+  let s:git.oldbuf = bufnr('%')
+  call s:GitScratch('GitOld')
+
+  " 右：新版本（暂存区 / 工作区）
+  belowright vertical new
+  let s:git.newbuf = bufnr('%')
+  call s:GitScratch('GitNew')
+
+  " 状态窗口固定宽度，焦点留在状态窗口
+  call win_gotoid(bufwinid(s:git.bufnr))
+  vertical resize 34
+  call s:GitRefresh()
+endfunction
+
+function! s:GitClose() abort
+  if s:git.closing
+    return
+  endif
+  let s:git.closing = 1
+  for l:b in [s:git.oldbuf, s:git.newbuf, s:git.bufnr]
+    let l:w = bufwinid(l:b)
+    if l:w != -1
+      call win_gotoid(l:w)
+      close
+    endif
+  endfor
+  let s:git.bufnr = -1
+  let s:git.oldbuf = -1
+  let s:git.newbuf = -1
+endfunction
+
+function! s:GitRefresh() abort
+  let s:git.lines = []
+  let l:display = ['# Changes （回车打开, s=stage, u=unstage, r=刷新, q=关闭）']
+  call add(s:git.lines, #{type: 'header'})
+  for l:line in systemlist('git -C ' . shellescape(s:git.root) . ' status --porcelain')
+    let l:x = strpart(l:line, 0, 1)
+    let l:y = strpart(l:line, 1, 1)
+    let l:path = strpart(l:line, 3)
+    " 重命名条目取新路径
+    let l:path = substitute(l:path, '.* -> ', '', '')
+    let l:path = substitute(l:path, '^"\|"$', '', 'g')
+    call add(l:display, strpart(l:line, 0, 2) . ' ' . l:path)
+    call add(s:git.lines, #{type: 'file', path: l:path,
+          \ untracked: l:x ==# '?', staged: l:x !~# '[ ?]'})
+  endfor
+
+  let l:buf = s:git.bufnr
+  call setbufvar(l:buf, '&modifiable', 1)
+  call setbufline(l:buf, 1, l:display)
+  let l:total = len(getbufline(l:buf, 1, '$'))
+  if l:total > len(l:display)
+    call deletebufline(l:buf, len(l:display) + 1, l:total)
+  endif
+  call setbufvar(l:buf, '&modifiable', 0)
+  call s:GitUpdateDiff()
+endfunction
+
+" 光标所在行对应的节点
+function! s:GitCurrentNode() abort
+  let l:idx = line('.') - 1
+  if l:idx < 0 || l:idx >= len(s:git.lines)
+    return {'type': 'none'}
+  endif
+  return s:git.lines[l:idx]
+endfunction
+
+" 把内容写入 diff 窗格
+function! s:GitSetPane(buf, lines) abort
+  let l:lines = empty(a:lines) ? [''] : a:lines
+  call setbufvar(a:buf, '&modifiable', 1)
+  call setbufline(a:buf, 1, l:lines)
+  let l:total = len(getbufline(a:buf, 1, '$'))
+  if l:total > len(l:lines)
+    call deletebufline(a:buf, len(l:lines) + 1, l:total)
+  endif
+  call setbufvar(a:buf, '&modifiable', 0)
+endfunction
+
+" git show 取某个版本的文件内容，失败（如新文件未入 HEAD）返回空列表
+function! s:GitShow(ref) abort
+  let l:out = systemlist('git -C ' . shellescape(s:git.root)
+        \ . ' show ' . shellescape(a:ref) . ' 2>/dev/null')
+  return v:shell_error != 0 ? [] : l:out
+endfunction
+
+" 给窗格设置语法高亮：按真实文件路径检测文件类型；空路径则清除
+function! s:GitSetPaneSyntax(buf, path) abort
+  let l:w = bufwinid(a:buf)
+  if l:w == -1
+    return
+  endif
+  if empty(a:path)
+    call win_execute(l:w, 'setlocal syntax=')
+  else
+    call win_execute(l:w, 'doautocmd <nomodeline> BufRead ' . fnameescape(a:path))
+  endif
+endfunction
+
+" 光标移动时延迟更新 diff：定时器回调不在自动命令上下文里，
+" 这样窗格的语法高亮（doautocmd 文件类型检测）才能生效；同时起到防抖作用
+function! s:GitScheduleDiff() abort
+  if s:git.difftimer != -1
+    call timer_stop(s:git.difftimer)
+  endif
+  let s:git.difftimer = timer_start(80, {t -> s:GitUpdateDiff()})
+endfunction
+
+" 光标移动时用 vim 内置 diff 模式做 split diff（旧版本 | 新版本）
+function! s:GitUpdateDiff() abort
+  let l:oldwin = bufwinid(s:git.oldbuf)
+  let l:newwin = bufwinid(s:git.newbuf)
+  if l:oldwin == -1 || l:newwin == -1
+    return
+  endif
+  call win_execute(l:oldwin, 'diffoff')
+  call win_execute(l:newwin, 'diffoff')
+  let l:node = s:GitCurrentNode()
+  let l:ft_path = ''
+  let l:use_diff = 0
+  if l:node.type ==# 'file'
+    let l:full = s:git.root . '/' . l:node.path
+    if isdirectory(l:full)
+      " 新增目录：列出其中的内容
+      call s:GitSetPane(s:git.oldbuf, ['（新增目录）'])
+      call s:GitSetPane(s:git.newbuf, readdir(l:full))
+    else
+      if l:node.untracked
+        call s:GitSetPane(s:git.oldbuf, [])
+        call s:GitSetPane(s:git.newbuf, filereadable(l:full)
+              \ ? readfile(l:full, '', 2000) : ['（无法读取）'])
+      elseif l:node.staged
+        call s:GitSetPane(s:git.oldbuf, s:GitShow('HEAD:' . l:node.path))
+        call s:GitSetPane(s:git.newbuf, s:GitShow(':' . l:node.path))
+      else
+        call s:GitSetPane(s:git.oldbuf, s:GitShow(':' . l:node.path))
+        call s:GitSetPane(s:git.newbuf, filereadable(l:full)
+              \ ? readfile(l:full, '', 2000) : ['（无法读取）'])
+      endif
+      let l:ft_path = l:full
+      let l:use_diff = 1
+    endif
+    call s:GitSetPaneSyntax(s:git.oldbuf, l:ft_path)
+    call s:GitSetPaneSyntax(s:git.newbuf, l:ft_path)
+  else
+    call s:GitSetPane(s:git.oldbuf, ['（无内容）'])
+    call s:GitSetPane(s:git.newbuf, [''])
+    call s:GitSetPaneSyntax(s:git.oldbuf, '')
+    call s:GitSetPaneSyntax(s:git.newbuf, '')
+  endif
+  if l:use_diff
+    call win_execute(l:oldwin, 'diffthis')
+    call win_execute(l:newwin, 'diffthis')
+  endif
+endfunction
+
+function! s:GitOpenFile() abort
+  let l:node = s:GitCurrentNode()
+  if l:node.type !=# 'file'
+    return
+  endif
+  let l:path = s:git.root . '/' . l:node.path
+  call s:GitClose()
+  execute 'edit ' . fnameescape(l:path)
+endfunction
+
+" stage：git add 选中的文件（未跟踪文件/目录同样适用）
+function! s:GitStageFile() abort
+  let l:node = s:GitCurrentNode()
+  if l:node.type !=# 'file'
+    echo '请把光标放在要 stage 的文件上'
+    return
+  endif
+  call system('git -C ' . shellescape(s:git.root)
+        \ . ' add -- ' . shellescape(l:node.path))
+  if v:shell_error != 0
+    echo 'git add 失败: ' . l:node.path
+    return
+  endif
+  call s:GitRefresh()
+endfunction
+
+" unstage：取消暂存选中的文件（git restore --staged）
+function! s:GitUnstageFile() abort
+  let l:node = s:GitCurrentNode()
+  if l:node.type !=# 'file' || !get(l:node, 'staged', 0)
+    echo '请把光标放在已暂存的文件上'
+    return
+  endif
+  call system('git -C ' . shellescape(s:git.root)
+        \ . ' restore --staged -- ' . shellescape(l:node.path) . ' 2>/dev/null')
+  if v:shell_error != 0
+    " 老版本 git 没有 restore，退回 reset
+    call system('git -C ' . shellescape(s:git.root)
+          \ . ' reset -q HEAD -- ' . shellescape(l:node.path))
+  endif
+  call s:GitRefresh()
+endfunction
+
+nnoremap <leader>g :call <SID>GitToggle()<CR>
+
+" ===== 状态栏显示当前行的 git blame =====
+" 光标停留（CursorHold）时查询当前行的 blame 信息，显示在状态栏右侧
+set statusline+=%{get(b:,'blame_info','')}
+
+augroup GitBlameStatus
+  autocmd!
+  autocmd CursorHold * call <SID>BlameUpdate()
+augroup END
+
+function! s:BlameUpdate() abort
+  if &buftype !=# '' || expand('%:p') ==# '' || !filereadable(expand('%:p'))
+    let b:blame_info = ''
+    return
+  endif
+  let l:lnum = line('.')
+  " 同一行且文件未变时不重复查询
+  if exists('b:blame_last') && b:blame_last[0] == l:lnum
+        \ && b:blame_last[1] == getftime(expand('%:p'))
+    return
+  endif
+  let b:blame_last = [l:lnum, getftime(expand('%:p'))]
+  let l:out = systemlist('git blame -L ' . l:lnum . ',' . l:lnum
+        \ . ' --porcelain -- ' . shellescape(expand('%:p')) . ' 2>/dev/null')
+  if v:shell_error != 0 || empty(l:out)
+    let b:blame_info = ''
+    redrawstatus
+    return
+  endif
+  let l:author = matchstr(get(filter(copy(l:out), 'v:val =~# "^author "'), 0, ''),
+        \ '^author \zs.*')
+  let l:time = str2nr(matchstr(get(filter(copy(l:out), 'v:val =~# "^author-time "'), 0, ''),
+        \ '\d\+'))
+  let l:summary = matchstr(get(filter(copy(l:out), 'v:val =~# "^summary "'), 0, ''),
+        \ '^summary \zs.*')
+  if l:author =~# 'Not Committed'
+    let b:blame_info = ' [Not committed]'
+  else
+    " 作者在最前并保证完整显示，摘要过长时截断
+    let l:info = ' [' . l:author . ' ' . strftime('%Y-%m-%d', l:time)
+    let l:room = 50 - strchars(l:info)
+    if l:room > 1 && !empty(l:summary)
+      let l:info .= ' ' . strcharpart(l:summary, 0, l:room)
+      if strchars(l:summary) > l:room
+        let l:info .= '…'
+      endif
+    endif
+    let b:blame_info = l:info . ']'
+  endif
+  redrawstatus
+endfunction
+
+" ===== 纯 Vimscript Buffer 切换栏 =====
+" <leader>b 在底部以状态栏形式横向显示所有 buffer：
+"   Tab / Shift-Tab  循环切换 buffer（即时生效）
+"   每个 buffer 带两个字母标识：绿色=切换过去，红色=关闭它
+"   标识符按 a b c ... 分配，不够用 aa bb cc ...
+"   输入字母时只显示标识符以输入内容开头的 buffer；只剩唯一候选时立即执行
+"   输入是某个标识符的精确匹配但有更长候选时（如 a 与 aa），按回车执行精确匹配项
+"   回车 切换到当前选中的 buffer，Esc 关闭
+
+highlight BufSwitch ctermfg=green guifg=green
+highlight BufClose ctermfg=red guifg=red
+if !empty(prop_type_get('bb_switch'))
+  call prop_type_delete('bb_switch')
+endif
+call prop_type_add('bb_switch', #{highlight: 'BufSwitch', priority: 20})
+if !empty(prop_type_get('bb_close'))
+  call prop_type_delete('bb_close')
+endif
+call prop_type_add('bb_close', #{highlight: 'BufClose', priority: 20})
+
+let s:bb = {'popup': -1, 'bufs': [], 'sel': 0, 'input': '', 'win': -1}
+
+" 标识符序列：a..z, aa..zz, aaa...
+function! s:BufLabel(n) abort
+  return repeat(nr2char(char2nr('a') + a:n % 26), a:n / 26 + 1)
+endfunction
+
+function! s:BufBarCollect() abort
+  let s:bb.bufs = map(getbufinfo({'buflisted': 1}),
+        \ {_, b -> {'nr': b.bufnr, 'name': b.name, 'changed': b.changed}})
+endfunction
+
+function! s:BufBarOpen() abort
+  if s:bb.popup != -1
+    call s:BufBarClose()
+    return
+  endif
+  let s:bb.win = win_getid()
+  let s:bb.input = ''
+  call s:BufBarCollect()
+  if empty(s:bb.bufs)
+    echo '没有可用的 buffer'
+    return
+  endif
+  " 当前 buffer 作为初始选中
+  let s:bb.sel = 0
+  let l:cur = bufnr('%')
+  for l:i in range(len(s:bb.bufs))
+    if s:bb.bufs[l:i].nr == l:cur
+      let s:bb.sel = l:i
+      break
+    endif
+  endfor
+  let s:bb.popup = popup_create('', #{
+        \ line: &lines - 1, col: 1,
+        \ minwidth: &columns, maxwidth: &columns,
+        \ zindex: 200, mapping: 0,
+        \ highlight: 'FuzzyPopup',
+        \ filter: function('s:BufBarFilter'),
+        \ })
+  call s:BufBarRender()
+endfunction
+
+function! s:BufBarRender() abort
+  let l:line = empty(s:bb.input) ? '' : '[' . s:bb.input . '] '
+  let l:props = []
+  for l:i in range(len(s:bb.bufs))
+    let l:b = s:bb.bufs[l:i]
+    let l:sw = s:BufLabel(l:i * 2)
+    let l:cl = s:BufLabel(l:i * 2 + 1)
+    " 过滤：只显示标识符以输入内容开头的 buffer
+    if !empty(s:bb.input) && stridx(l:sw, s:bb.input) != 0 && stridx(l:cl, s:bb.input) != 0
+      continue
+    endif
+    let l:title = empty(l:b.name) ? '[No Name]' : fnamemodify(l:b.name, ':t')
+    let l:title .= l:b.changed ? '+' : ''
+    let l:tab = ' ' . l:sw . ' ' . l:cl . ' ' . l:title . ' '
+    let l:start = strlen(l:line)
+    " 绿色=切换标识，红色=关闭标识（高优先级，选中反色不覆盖字母颜色）
+    call add(l:props, #{col: l:start + 2, length: strlen(l:sw), type: 'bb_switch'})
+    call add(l:props, #{col: l:start + 2 + strlen(l:sw) + 1, length: strlen(l:cl), type: 'bb_close'})
+    if l:i == s:bb.sel
+      call add(l:props, #{col: l:start + 1, length: strlen(l:tab), type: 'ff_sel'})
+    endif
+    let l:line .= l:tab
+  endfor
+  if l:line =~# '^\[.*\] $'
+    let l:line .= '（无匹配）'
+  endif
+  call popup_settext(s:bb.popup, [#{text: empty(l:line) ? ' （无 buffer）' : l:line, props: l:props}])
+endfunction
+
+function! s:BufBarFilter(id, key) abort
+  if a:key ==# "\<Esc>" || a:key ==# "\<C-c>"
+    call s:BufBarClose()
+  elseif a:key ==# "\<Tab>"
+    call s:BufBarCycle(1)
+  elseif a:key ==# "\<S-Tab>"
+    call s:BufBarCycle(-1)
+  elseif a:key ==# "\<CR>"
+    " 有输入时优先执行精确匹配的标识符（用于 a 与 aa 并存时的消歧）
+    if !empty(s:bb.input)
+      for l:i in range(len(s:bb.bufs))
+        if s:bb.input ==# s:BufLabel(l:i * 2)
+          call s:BufBarSwitch(l:i)
+          call s:BufBarClose()
+          return 1
+        elseif s:bb.input ==# s:BufLabel(l:i * 2 + 1)
+          call s:BufBarDelete(l:i)
+          return 1
+        endif
+      endfor
+    endif
+    call s:BufBarSwitch(s:bb.sel)
+    call s:BufBarClose()
+  elseif a:key ==# "\<BS>" || a:key ==# "\<C-h>"
+    if !empty(s:bb.input)
+      let s:bb.input = strcharpart(s:bb.input, 0, strchars(s:bb.input) - 1)
+      call s:BufBarRender()
+    endif
+  elseif a:key =~# '^[a-z]$'
+    let s:bb.input .= a:key
+    " 候选：标识符以输入内容开头；只剩唯一候选时立即执行
+    let l:switch_to = -1
+    let l:close_idx = -1
+    let l:count = 0
+    for l:i in range(len(s:bb.bufs))
+      if stridx(s:BufLabel(l:i * 2), s:bb.input) == 0
+        let l:switch_to = l:i
+        let l:count += 1
+      elseif stridx(s:BufLabel(l:i * 2 + 1), s:bb.input) == 0
+        let l:close_idx = l:i
+        let l:count += 1
+      endif
+    endfor
+    if l:count == 1
+      if l:switch_to >= 0
+        call s:BufBarSwitch(l:switch_to)
+        call s:BufBarClose()
+      else
+        call s:BufBarDelete(l:close_idx)
+      endif
+      return 1
+    endif
+    " 没有任何候选时，清空输入重来
+    if l:count == 0
+      let s:bb.input = ''
+    endif
+    call s:BufBarRender()
+  endif
+  return 1
+endfunction
+
+function! s:BufBarCycle(step) abort
+  if empty(s:bb.bufs)
+    return
+  endif
+  let s:bb.sel = (s:bb.sel + a:step) % len(s:bb.bufs)
+  if s:bb.sel < 0
+    let s:bb.sel += len(s:bb.bufs)
+  endif
+  call s:BufBarSwitch(s:bb.sel)
+  call s:BufBarRender()
+endfunction
+
+function! s:BufBarSwitch(i) abort
+  if a:i < 0 || a:i >= len(s:bb.bufs)
+    return
+  endif
+  let l:nr = s:bb.bufs[a:i].nr
+  if win_id2win(s:bb.win) > 0
+    call win_execute(s:bb.win, 'buffer ' . l:nr)
+  else
+    execute 'buffer ' . l:nr
+  endif
+endfunction
+
+function! s:BufBarDelete(i) abort
+  if a:i < 0 || a:i >= len(s:bb.bufs)
+    return
+  endif
+  let l:b = s:bb.bufs[a:i]
+  if l:b.changed
+    echo fnamemodify(l:b.name, ':t') . ' 有未保存的修改，未关闭'
+    let s:bb.input = ''
+    call s:BufBarRender()
+    return
+  endif
+  execute 'bdelete ' . l:b.nr
+  call s:BufBarCollect()
+  let s:bb.input = ''
+  let s:bb.sel = empty(s:bb.bufs) ? 0 : min([s:bb.sel, len(s:bb.bufs) - 1])
+  call s:BufBarRender()
+endfunction
+
+function! s:BufBarClose() abort
+  if s:bb.popup != -1
+    call popup_close(s:bb.popup)
+    let s:bb.popup = -1
+  endif
+endfunction
+
+nnoremap <leader>b :call <SID>BufBarOpen()<CR>
