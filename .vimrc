@@ -446,7 +446,7 @@ xnoremap <leader>ff :<C-u>call <SID>VisualFindFile()<CR>
 
 " ===== 纯 Vimscript 文件树侧边栏 =====
 " <leader>e 开关侧边栏
-" 树中按键：回车(或 o) 打开文件 / 展开折叠目录，r 刷新，q 关闭
+" 树中按键：回车(或 o) 打开文件 / 展开折叠目录，- 水平分屏打开，\ 垂直分屏打开，r 刷新，q 关闭
 
 let s:tree = {'bufnr': -1, 'expanded': {}, 'lines': []}
 
@@ -469,6 +469,8 @@ function! s:TreeOpen() abort
   file FileTree
   nnoremap <buffer> <CR> :call <SID>TreeActivate()<CR>
   nnoremap <buffer> o :call <SID>TreeActivate()<CR>
+  nnoremap <buffer> - :call <SID>TreeActivate('split')<CR>
+  nnoremap <buffer> <Bslash> :call <SID>TreeActivate('vsplit')<CR>
   nnoremap <buffer> r :call <SID>TreeRender()<CR>
   nnoremap <buffer> q :close<CR>
   call s:TreeRender()
@@ -520,7 +522,9 @@ function! s:TreeAddNodes(dir, depth, display, guard) abort
   endfor
 endfunction
 
-function! s:TreeActivate() abort
+" how: edit=在之前窗口打开, split=水平分屏, vsplit=垂直分屏（目录节点始终为展开/折叠）
+function! s:TreeActivate(...) abort
+  let l:how = a:0 > 0 ? a:1 : 'edit'
   let l:idx = line('.') - 1
   if l:idx < 0 || l:idx >= len(s:tree.lines)
     return
@@ -534,7 +538,7 @@ function! s:TreeActivate() abort
   else
     " 在之前的窗口中打开文件，焦点随之过去
     wincmd p
-    execute 'edit ' . fnameescape(l:node.path)
+    execute l:how . ' ' . fnameescape(l:node.path)
   endif
 endfunction
 
