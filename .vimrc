@@ -1333,3 +1333,20 @@ nnoremap <C-h> <C-w>h
 nnoremap <C-j> <C-w>j
 nnoremap <C-k> <C-w>k
 nnoremap <C-l> <C-w>l
+
+" ===== 显示缩进用的是空格还是 Tab =====
+" 开启后每行行首一眼可辨：
+"   Tab 缩进   显示为 "→      "（箭头）
+"   空格缩进   显示为 "····"（暗灰色小点）
+" 另外行尾多余空格显示为 "·"，nbsp 显示为 "␣"
+" <leader>l 可随时开关这个显示
+set list
+" 旧版本 Vim 的 listchars 不支持 lead（行首空格），失败时退回只显示 Tab
+try
+  set listchars=tab:→\ ,lead:·,trail:·,nbsp:␣
+catch
+  set listchars=tab:→\ ,trail:·,nbsp:␣
+endtry
+" 这些符号用暗灰色显示，不抢眼
+highlight SpecialKey ctermfg=darkgray guifg=#555555
+nnoremap <leader>l :set list!<CR>
