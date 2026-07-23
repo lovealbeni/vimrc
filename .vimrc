@@ -121,7 +121,103 @@ augroup AutoReload
   autocmd CursorHold,CursorHoldI * checktime
   autocmd BufEnter * checktime
   autocmd FocusGained * checktime
+  " 文件在磁盘上被修改且 vim 中也有未保存修改时，询问如何处理
+  autocmd FileChangedShell * call <SID>HandleFileChanged()
 augroup END
+
+" 外部修改与 vim 本地修改冲突时的处理（popup 弹窗询问）：
+"   Y   = 覆盖：用 vim 中的内容写回磁盘（保留 vim 修改）
+"   N   = 不覆盖：放弃 vim 中的修改，加载磁盘上的最新内容
+"   Esc = 暂不处理，保留 vim 修改，下次触发时再询问
+function! s:HandleFileChanged() abort
+  let l:buf = str2nr(expand('<abuf>'))
+  " vim 中没有本地修改时交给 autoread 自动加载，无需处理
+  if !getbufvar(l:buf, '&modified')
+    return
+  endif
+  " 有本地修改时由本函数全权处理，阻止 vim 默认的 W12 警告
+  let v:fcs_choice = ''
+  let l:name = fnamemodify(bufname(l:buf), ':t')
+  if v:fcs_reason ==# 'deleted'
+    echohl WarningMsg
+    echom '文件 "' . l:name . '" 已在磁盘上被删除，vim 中的内容保持不变'
+    echohl None
+    return
+  endif
+  " 只是时间戳变化（内容相同）时不打扰
+  if v:fcs_reason !=# 'changed' && v:fcs_reason !=# 'conflict'
+    return
+  endif
+  " 该 buffer 已有弹窗时不重复弹
+  if getbufvar(l:buf, 'conflict_popup', 0)
+    return
+  endif
+  call setbufvar(l:buf, 'conflict_popup', 1)
+  call popup_dialog(
+        \ '文件 "' . l:name . '" 在磁盘上发生了变化，' . "\n"
+        \ . '且 vim 中也有未保存的修改。' . "\n\n"
+        \ . '是否用 vim 中的内容覆盖磁盘文件？' . "\n\n"
+        \ . '[Y] 覆盖（保留 vim 修改，写回磁盘）' . "\n"
+        \ . '[N] 不覆盖（放弃 vim 修改，加载磁盘最新内容）' . "\n"
+        \ . '[Esc] 暂不处理，保留 vim 修改',
+        \ #{
+        \   filter: function('s:ConflictFilter'),
+        \   callback: function('s:OnConflictChoice', [l:buf]),
+        \   highlight: 'FuzzyPopup',
+        \   border: [],
+        \   padding: [0, 2, 0, 2],
+        \ })
+endfunction
+
+" 弹窗按键：Y=覆盖 N=不覆盖 Esc/Ctrl-C=稍后，其他键放行给正常编辑
+function! s:ConflictFilter(id, key) abort
+  if a:key ==# 'y' || a:key ==# 'Y' || a:key ==# "\<CR>"
+    call popup_close(a:id, 1)
+  elseif a:key ==# 'n' || a:key ==# 'N'
+    call popup_close(a:id, 0)
+  elseif a:key ==# "\<Esc>" || a:key ==# "\<C-c>"
+    call popup_close(a:id, -1)
+  else
+    return 0
+  endif
+  return 1
+endfunction
+
+" popup_dialog 是异步的，按键结果通过回调返回；用定时器延迟执行，
+" 避免在 popup 回调上下文里直接改写 buffer
+function! s:OnConflictChoice(buf, id, result) abort
+  call setbufvar(a:buf, 'conflict_popup', 0)
+  if a:result == 1
+    call timer_start(10, {t -> s:ConflictApply(a:buf, 'write!')})
+  elseif a:result == 0
+    call timer_start(10, {t -> s:ConflictApply(a:buf, 'edit!')})
+  endif
+  " 其他（Esc / Ctrl-C 关闭弹窗）：什么都不做，保留 vim 修改
+endfunction
+
+" 在指定 buffer 的窗口里执行 :write!（覆盖磁盘）或 :edit!（重新加载磁盘内容）
+function! s:ConflictApply(buf, cmd) abort
+  if !bufexists(a:buf) || !getbufvar(a:buf, '&modified')
+    return
+  endif
+  let l:win = bufwinid(a:buf)
+  if l:win == -1 && bufnr('%') != a:buf
+    " buffer 不在任何窗口中（极少见），无法安全执行，等下次触发再询问
+    return
+  endif
+  if a:cmd ==# 'write!'
+    " write! 遇到磁盘文件已变化时会再弹一次 "(y/n)" 确认，预先回答 y 避免二次确认
+    call feedkeys('y', 'nL')
+  endif
+  if l:win != -1
+    call win_execute(l:win, a:cmd)
+  else
+    execute a:cmd
+  endif
+  if a:cmd ==# 'write!'
+    echom '已用 vim 中的内容覆盖磁盘文件'
+  endif
+endfunction
 
 " 可选：添加文件修改提示
 set report=0
@@ -1049,3 +1145,191 @@ function! s:BufBarClose() abort
 endfunction
 
 nnoremap <leader>b :call <SID>BufBarOpen()<CR>
+
+" ===== Git 行状态标记（sign 列显示新增/修改行）+ 修改块 diff 预览 =====
+" 在行号左侧的 sign 列用颜色标出当前文件相对 git 暂存区的变化：
+"   绿色 + = 新增行，黄色 ~ = 修改行（未跟踪文件所有行标记为新增）
+" 更新时机：打开文件、保存文件后立即刷新；编辑停止约 0.3 秒后自动刷新
+" <leader>d 在光标所在的修改块弹出 diff 预览窗口（q / Esc 关闭）
+
+highlight GitSignAdd ctermfg=green guifg=green
+highlight GitSignChange ctermfg=yellow guifg=yellow
+sign define GitSignAdd text=+ texthl=GitSignAdd
+sign define GitSignChange text=~ texthl=GitSignChange
+
+let s:gitsign_timer = -1
+
+augroup GitSigns
+  autocmd!
+  autocmd BufEnter,BufWritePost * call <SID>GitSignsUpdate()
+  autocmd TextChanged,TextChangedI * call <SID>GitSignsSchedule()
+augroup END
+
+" 编辑后防抖刷新，避免每次按键都跑一次 git + diff
+function! s:GitSignsSchedule() abort
+  if s:gitsign_timer != -1
+    call timer_stop(s:gitsign_timer)
+  endif
+  let s:gitsign_timer = timer_start(300, {t -> s:GitSignsUpdate()})
+endfunction
+
+function! s:GitSignsUpdate() abort
+  let l:buf = bufnr('%')
+  call sign_unplace('gitsigns', #{buffer: l:buf})
+  let b:gitsign_hunks = []
+  if &buftype !=# '' || expand('%:p') ==# ''
+    return
+  endif
+  let l:root = trim(system('git -C ' . shellescape(expand('%:p:h'))
+        \ . ' rev-parse --show-toplevel 2>/dev/null'))
+  if v:shell_error != 0 || empty(l:root)
+    return
+  endif
+  " ls-files 同时用于判断文件是否被 git 跟踪，并取仓库相对路径
+  let l:rel = trim(system('git -C ' . shellescape(l:root)
+        \ . ' ls-files --full-name -- ' . shellescape(expand('%:p'))))
+  if empty(l:rel)
+    " 未跟踪文件：所有行都标记为新增
+    let l:hunk = #{start: 1, end: line('$'), lines: []}
+    for l:l in getline(1, '$')
+      call add(l:hunk.lines, '+' . l:l)
+    endfor
+    let b:gitsign_hunks = [l:hunk]
+    call s:GitSignsPlace(l:buf, 1, line('$'), 'GitSignAdd')
+    return
+  endif
+  " 以暂存区版本为基准（未暂存过时即 HEAD 版本）
+  let l:base = systemlist('git -C ' . shellescape(l:root)
+        \ . ' show ' . shellescape(':' . l:rel) . ' 2>/dev/null')
+  call s:GitSignsDiff(l:buf, l:base, getline(1, '$'))
+endfunction
+
+" 用外部 diff 对比基准版本和 buffer 当前内容，解析 hunk、放置 sign、记录 diff 文本
+function! s:GitSignsDiff(buf, base, cur) abort
+  let l:tmpA = tempname()
+  let l:tmpB = tempname()
+  call writefile(a:base, l:tmpA)
+  call writefile(a:cur, l:tmpB)
+  let l:diff = systemlist('diff -U3 ' . shellescape(l:tmpA) . ' ' . shellescape(l:tmpB))
+  call delete(l:tmpA)
+  call delete(l:tmpB)
+
+  " 先按 @@ 头切分 hunk，保留完整 hunk 文本供 diff 预览
+  let l:hunks = []
+  let l:h = {}
+  for l:line in l:diff
+    if l:line =~# '^@@'
+      let l:m = matchlist(l:line,
+            \ '^@@ -\(\d\+\)\%(,\(\d\+\)\)\? +\(\d\+\)\%(,\(\d\+\)\)\? @@')
+      let l:h = #{new_start: str2nr(l:m[3]),
+            \ new_n: l:m[4] ==# '' ? 1 : str2nr(l:m[4]),
+            \ lines: [l:line]}
+      call add(l:hunks, l:h)
+    elseif !empty(l:h) && l:line !~# '^[+-]\{3}'
+      call add(l:h.lines, l:line)
+    endif
+  endfor
+
+  " hunk 内部按上下文行分隔成若干变化组，逐组分类：
+  "   只有 '+' 行       = 新增（绿色）
+  "   既有 '-' 又有 '+' = 修改（黄色）
+  "   只有 '-' 行       = 删除，无对应行可标记，仅记录位置供 diff 预览
+  for l:h in l:hunks
+    " 整个 hunk 在新侧为 0 行时，new_start 指删除点之前的那一行
+    let l:st = #{new: l:h.new_n == 0 ? l:h.new_start + 1 : l:h.new_start,
+          \ minus: 0, plus_first: -1, plus_n: 0}
+    for l:ln in l:h.lines[1:]
+      if l:ln =~# '^\\'
+        continue
+      endif
+      let l:type = l:ln[0]
+      if l:type ==# ' '
+        " 上下文行：结算当前变化组
+        call s:GitSignsGroupEnd(a:buf, l:h, l:st)
+        let l:st.new += 1
+      elseif l:type ==# '-'
+        let l:st.minus += 1
+      elseif l:type ==# '+'
+        if l:st.plus_first < 0
+          let l:st.plus_first = l:st.new
+        endif
+        let l:st.plus_n += 1
+        let l:st.new += 1
+      endif
+    endfor
+    " 结算 hunk 末尾的变化组
+    call s:GitSignsGroupEnd(a:buf, l:h, l:st)
+  endfor
+endfunction
+
+" 结算一个变化组：放置 sign 或记录删除位置，然后重置组状态
+function! s:GitSignsGroupEnd(buf, h, st) abort
+  if a:st.plus_n > 0
+    let l:last = a:st.plus_first + a:st.plus_n - 1
+    call s:GitSignsPlace(a:buf, a:st.plus_first, l:last,
+          \ a:st.minus > 0 ? 'GitSignChange' : 'GitSignAdd')
+    call add(b:gitsign_hunks,
+          \ #{start: a:st.plus_first, end: l:last, lines: a:h.lines})
+  elseif a:st.minus > 0
+    " 纯删除：锚定在删除点前的行
+    let l:anchor = max([1, a:st.new - 1])
+    call add(b:gitsign_hunks,
+          \ #{start: l:anchor, end: l:anchor, lines: a:h.lines})
+  endif
+  let a:st.minus = 0
+  let a:st.plus_first = -1
+  let a:st.plus_n = 0
+endfunction
+
+function! s:GitSignsPlace(buf, first, last, type) abort
+  for l:lnum in range(a:first, a:last)
+    call sign_place(0, 'gitsigns', a:type, a:buf, #{lnum: l:lnum, priority: 10})
+  endfor
+endfunction
+
+" <leader>d：预览光标所在修改块的 diff（含上下文，diff 语法高亮）
+function! s:GitHunkPopup() abort
+  let l:lnum = line('.')
+  for l:h in get(b:, 'gitsign_hunks', [])
+    if l:lnum >= l:h.start && l:lnum <= l:h.end
+      let l:id = popup_create(l:h.lines, #{
+            \ title: ' git diff（q / Esc 关闭） ',
+            \ border: [],
+            \ padding: [0, 1, 0, 1],
+            \ pos: 'topleft',
+            \ line: 'cursor+1',
+            \ col: 'cursor',
+            \ maxwidth: &columns - 8,
+            \ maxheight: &lines - 8,
+            \ wrap: 0,
+            \ highlight: 'FuzzyPopup',
+            \ filter: function('s:GitHunkPopupFilter'),
+            \ })
+      call win_execute(l:id, 'setlocal syntax=diff')
+      return
+    endif
+  endfor
+  echo '当前行不在任何修改块中'
+endfunction
+
+function! s:GitHunkPopupFilter(id, key) abort
+  if a:key ==# "\<Esc>" || a:key ==# 'q' || a:key ==# "\<C-c>"
+    call popup_close(a:id)
+    return 1
+  endif
+  return 0
+endfunction
+
+nnoremap <leader>d :call <SID>GitHunkPopup()<CR>
+
+" ===== 常用快捷键 =====
+" Ctrl+S 保存（仅在有修改时写入）
+nnoremap <C-s> :update<CR>
+inoremap <C-s> <C-o>:update<CR>
+xnoremap <C-s> <Esc>:update<CR>
+
+" Ctrl + h/j/k/l 在分屏窗口之间移动
+nnoremap <C-h> <C-w>h
+nnoremap <C-j> <C-w>j
+nnoremap <C-k> <C-w>k
+nnoremap <C-l> <C-w>l
